@@ -120,6 +120,7 @@ python bin/fdup.py [OPTIONS] DIRECTORY [DIRECTORY ...]
 | `--md5_max_size` | Maximum KB to read for MD5 (0 = full file) |
 | `--hash-threads N` | Number of threads for MD5 hashing (0 = use --threads value) |
 | `--require-stable` | Skip files that change during MD5 hashing (checks size/mtime) |
+| `--md5-cache [FILE]` | Cache MD5 hashes to speed up repeated scans (default: `fdup_md5_cache.json`) |
 
 #### Pattern Options
 
@@ -474,6 +475,7 @@ MD5 mode reads file contents, which is slow for large files.
 - Use `--md5_max_size` to limit how much of each file is read
 - Use NAMESIZE mode as a pre-filter
 - Use `--threads N` or `--hash-threads N` to parallelize file processing and hashing (useful for network shares)
+- Use `--md5-cache` to cache MD5 hashes and speed up repeated scans of the same directories
 
 ### Files skipped due to instability
 
@@ -490,3 +492,78 @@ When using `--require-stable`, files that change during hashing are skipped.
 The GUI requires you to click "Clear" before running a new scan.
 
 **Solution:** Click the "Clear" button to reset results before running again.
+
+---
+
+## MD5 Cache
+
+The MD5 cache feature (`--md5-cache`) stores computed MD5 hashes to speed up repeated scans of the same directories.
+
+### How it works
+
+1. When enabled, fdup loads the cache file at the start of a scan
+2. For each file that needs hashing, fdup checks if a valid cache entry exists
+3. A cache entry is valid only if:
+   - File path matches
+   - File size matches
+   - File modification time matches (nanosecond precision)
+   - MD5 settings match (`md5_mode`, `md5_max_size`)
+4. Valid cache hits skip MD5 computation entirely
+5. Cache misses are computed and added to the cache
+6. The updated cache is saved at the end of the scan
+
+### Usage examples
+
+```bash
+# Enable cache with default filename (fdup_md5_cache.json in current directory)
+python bin/fdup.py -c MD5 --md5-cache /path/to/photos
+
+# Enable cache with custom filename
+python bin/fdup.py -c MD5 --md5-cache my_cache.json /path/to/photos
+
+# Repeated scans use cached hashes for unchanged files
+python bin/fdup.py -c MD5 --md5-cache my_cache.json /path/to/photos  # Much faster!
+```
+
+### GUI usage
+
+1. Select "MD5" compare mode
+2. Check the "MD5 cache" checkbox
+3. Optionally enter a custom cache filename
+4. Run the scan
+
+### Cache file format
+
+The cache file is a JSON file with the following structure:
+
+```json
+{
+  "version": 1,
+  "cached_at": 1703548800.0,
+  "entries": {
+    "/absolute/path/to/file.jpg": {
+      "md5": "abc123...",
+      "md5_read_size": 1234567,
+      "size": 1234567,
+      "mtime_ns": 1703548800000000000,
+      "md5_mode": "DEFAULT",
+      "md5_max_size": 0
+    }
+  }
+}
+```
+
+### When to use caching
+
+- **Recommended:** Repeated scans of large directories with mostly unchanged files
+- **Recommended:** Network shares where I/O is expensive
+- **Not needed:** One-time scans or directories with frequently changing files
+
+### Cache invalidation
+
+The cache automatically invalidates entries when:
+- File size changes
+- File modification time changes
+- MD5 settings change (`--md5_mode`, `--md5_max_size`)
+
+You can safely delete the cache file at any time to force a full rescan.

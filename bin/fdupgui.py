@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QFormLayout, QComboBox, QPushButton, QListWidget, QTreeWidget,
     QTreeWidgetItem, QSplitter, QFileDialog, QGroupBox, QMessageBox,
     QHeaderView, QPlainTextEdit, QSpinBox, QInputDialog, QCheckBox,
-    QLabel, QMenuBar, QMenu, QAction, QProgressBar
+    QLabel, QMenuBar, QMenu, QAction, QProgressBar, QLineEdit
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QFont
@@ -36,6 +36,7 @@ from fdup.fduplib import (
     save_uniques_to_json,
     export_selected_files_to_script,
     DEFAULT_CONFIG_FILENAME,
+    DEFAULT_MD5_CACHE_FILENAME,
     load_scan_config,
     save_scan_config,
     ProgressEvent,
@@ -318,6 +319,20 @@ class FdupGuiWindow(QMainWindow):
         self.require_stable_checkbox.setToolTip("Skip files that change during hashing (checks size/mtime before and after)")
         layout.addWidget(self.require_stable_checkbox)
         
+        # MD5 Cache checkbox and filename (MD5 mode only)
+        cache_layout = QHBoxLayout()
+        self.md5_cache_checkbox = QCheckBox("MD5 cache")
+        self.md5_cache_checkbox.setToolTip("Cache MD5 hashes to speed up repeated scans. Only used with MD5 mode.")
+        self.md5_cache_checkbox.stateChanged.connect(self._update_md5_cache_filename_enabled)
+        cache_layout.addWidget(self.md5_cache_checkbox)
+        
+        self.md5_cache_filename = QLineEdit()
+        self.md5_cache_filename.setPlaceholderText(DEFAULT_MD5_CACHE_FILENAME)
+        self.md5_cache_filename.setToolTip("Cache filename (leave empty for default)")
+        self.md5_cache_filename.setEnabled(False)
+        cache_layout.addWidget(self.md5_cache_filename)
+        layout.addLayout(cache_layout)
+        
         # Script Type dropdown (for cleanup export)
         script_form = QFormLayout()
         self.script_type_combo = QComboBox()
@@ -331,6 +346,7 @@ class FdupGuiWindow(QMainWindow):
         # Set initial MD5 controls state
         self._update_md5_controls_enabled()
         self._update_iregex_enabled()
+        self._update_md5_cache_filename_enabled()
         
         # Spacer
         layout.addStretch()
@@ -583,6 +599,7 @@ class FdupGuiWindow(QMainWindow):
             threads=self.threads_spin.value(),
             hash_threads=self.hash_threads_spin.value(),
             require_stable=self.require_stable_checkbox.isChecked(),
+            md5_cache=self._get_md5_cache_path(),
             save2json=False,
             save_unique=False,
             json_filename="duplicate_files.json",
@@ -627,8 +644,27 @@ class FdupGuiWindow(QMainWindow):
         self.md5_max_size_spin.setEnabled(is_md5)
         self.hash_threads_spin.setEnabled(is_md5)
         self.require_stable_checkbox.setEnabled(is_md5)
+        self.md5_cache_checkbox.setEnabled(is_md5)
         if not is_md5:
             self.require_stable_checkbox.setChecked(False)
+            self.md5_cache_checkbox.setChecked(False)
+        self._update_md5_cache_filename_enabled()
+    
+    def _update_md5_cache_filename_enabled(self):
+        """Enable or disable MD5 cache filename based on checkbox state."""
+        is_md5 = self.compare_combo.currentText() == "MD5"
+        cache_enabled = self.md5_cache_checkbox.isChecked()
+        self.md5_cache_filename.setEnabled(is_md5 and cache_enabled)
+    
+    def _get_md5_cache_path(self):
+        """Get the MD5 cache path from UI state, or None if disabled."""
+        if not self.md5_cache_checkbox.isChecked():
+            return None
+        
+        filename = self.md5_cache_filename.text().strip()
+        if filename:
+            return filename
+        return DEFAULT_MD5_CACHE_FILENAME
     
     def _update_iregex_enabled(self):
         """Enable or disable iregex checkbox based on find mode and GNU find availability."""
@@ -921,6 +957,15 @@ class FdupGuiWindow(QMainWindow):
             if 'require_stable' in cfg:
                 self.require_stable_checkbox.setChecked(cfg['require_stable'])
             
+            # Populate md5_cache
+            if 'md5_cache' in cfg and cfg['md5_cache']:
+                self.md5_cache_checkbox.setChecked(True)
+                if cfg['md5_cache'] != DEFAULT_MD5_CACHE_FILENAME:
+                    self.md5_cache_filename.setText(cfg['md5_cache'])
+            else:
+                self.md5_cache_checkbox.setChecked(False)
+                self.md5_cache_filename.clear()
+            
             self.output_text.appendPlainText(f"Configuration loaded from {filename}")
             
         except FileNotFoundError:
@@ -991,6 +1036,11 @@ class FdupGuiWindow(QMainWindow):
         
         # Require Stable
         cfg['require_stable'] = self.require_stable_checkbox.isChecked()
+        
+        # MD5 Cache
+        md5_cache = self._get_md5_cache_path()
+        if md5_cache:
+            cfg['md5_cache'] = md5_cache
         
         return cfg
 
