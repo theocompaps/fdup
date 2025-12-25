@@ -86,6 +86,7 @@ ProgressCallback = Callable[[ProgressEvent], None]
 # Configuration file support
 CONFIG_VERSION = 1
 DEFAULT_CONFIG_FILENAME = "fdup_cfg.json"
+DEFAULT_MD5_CACHE_FILENAME = "fdup_md5_cache.json"
 
 # Keys that are part of scan configuration (not export actions)
 SCAN_CONFIG_KEYS = [
@@ -101,7 +102,100 @@ SCAN_CONFIG_KEYS = [
     'threads',
     'hash_threads',
     'require_stable',
+    'md5_cache',
 ]
+
+
+# MD5 cache support
+def load_md5_cache(cache_path: str) -> dict:
+    """
+    Load MD5 cache from a JSON file.
+    
+    Returns:
+        dict: Cache dictionary with absolute paths as keys.
+              Each entry contains: md5, md5_read_size, size, mtime_ns, md5_mode, md5_max_size
+    """
+    if not os.path.exists(cache_path):
+        return {}
+    
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Return the entries dict (or empty if missing)
+        return data.get('entries', {})
+    except (json.JSONDecodeError, IOError, OSError) as e:
+        print(f"Warning: Failed to load MD5 cache from {cache_path}: {e}", flush=True)
+        return {}
+
+
+def save_md5_cache(cache_path: str, cache_entries: dict, verbose: bool = True) -> None:
+    """
+    Save MD5 cache to a JSON file.
+    
+    Args:
+        cache_path: Path to cache file
+        cache_entries: Dictionary of cache entries (path -> entry dict)
+        verbose: If True, print status message
+    """
+    data = {
+        'version': 1,
+        'cached_at': time.time(),
+        'entries': cache_entries,
+    }
+    
+    try:
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        
+        if verbose:
+            print(f"MD5 cache saved to {cache_path} ({len(cache_entries)} entries)", flush=True)
+    except (IOError, OSError) as e:
+        print(f"Warning: Failed to save MD5 cache to {cache_path}: {e}", flush=True)
+
+
+def _get_cache_key(file_path: str) -> str:
+    """Get normalized absolute path for cache key."""
+    return os.path.normcase(os.path.abspath(file_path))
+
+
+def _is_cache_hit(cache_entry: dict, file_stat, args) -> bool:
+    """
+    Check if a cache entry is valid for the given file and settings.
+    
+    A cache hit requires:
+    - Same file size
+    - Same mtime_ns (or mtime if ns not available)
+    - Same md5_mode
+    - Same md5_max_size
+    """
+    # Check size
+    if cache_entry.get('size') != file_stat.st_size:
+        return False
+    
+    # Check mtime (use mtime_ns if available, otherwise mtime)
+    cached_mtime_ns = cache_entry.get('mtime_ns')
+    if cached_mtime_ns is not None:
+        # Compare nanosecond-precision mtime
+        current_mtime_ns = getattr(file_stat, 'st_mtime_ns', int(file_stat.st_mtime * 1e9))
+        if cached_mtime_ns != current_mtime_ns:
+            return False
+    else:
+        # Fallback to second-precision mtime
+        if cache_entry.get('mtime') != file_stat.st_mtime:
+            return False
+    
+    # Check md5_mode
+    md5_mode_str = str(getattr(args, 'md5_mode', MD5Mode.DEFAULT))
+    if cache_entry.get('md5_mode') != md5_mode_str:
+        return False
+    
+    # Check md5_max_size
+    md5_max_size = getattr(args, 'md5_max_size', 0) or 0
+    if cache_entry.get('md5_max_size', 0) != md5_max_size:
+        return False
+    
+    return True
 
 
 def args_to_scan_config_dict(args):
@@ -154,6 +248,9 @@ def args_to_scan_config_dict(args):
     if hasattr(args, 'require_stable'):
         config['require_stable'] = args.require_stable
     
+    if hasattr(args, 'md5_cache') and args.md5_cache:
+        config['md5_cache'] = args.md5_cache
+    
     return config
 
 
@@ -204,6 +301,9 @@ def apply_scan_config_dict_to_args(args, cfg_dict):
     
     if 'require_stable' in cfg_dict:
         args.require_stable = cfg_dict['require_stable']
+    
+    if 'md5_cache' in cfg_dict:
+        args.md5_cache = cfg_dict['md5_cache']
     
     return args
 
@@ -818,13 +918,24 @@ def _find_duplicate_files_md5_size_first(args, files, total_files, progress_cb: 
     
     1. Group all files by size globally across all roots
     2. Filter to only size groups with >1 file (potential duplicates)
-    3. Compute MD5 only for those candidate files
+    3. Compute MD5 only for those candidate files (with optional caching)
     4. Group by MD5 to find true duplicates
     
     This dramatically reduces the number of files that need to be hashed,
     especially useful for network shares where reading is expensive.
     """
     print("MD5 mode: Using size-first optimization", flush=True)
+    
+    # Load MD5 cache if enabled
+    cache_path = getattr(args, 'md5_cache', None)
+    cache_entries = {}
+    cache_hits = 0
+    cache_misses = 0
+    if cache_path:
+        print(f"  MD5 cache enabled: {cache_path}", flush=True)
+        cache_entries = load_md5_cache(cache_path)
+        if cache_entries:
+            print(f"  Loaded {len(cache_entries)} cached entries", flush=True)
     
     # Phase 1: Group all files by size globally
     print("Phase 1: Grouping files by size...", flush=True)
@@ -868,19 +979,57 @@ def _find_duplicate_files_md5_size_first(args, files, total_files, progress_cb: 
     
     # Flatten all candidate files for batch processing
     all_files_to_process = []
+    files_needing_hash = []
+    
     for size, group in candidate_groups.items():
         for file_info in group:
             full_path = file_info.get('full_path')
             if not full_path:
                 full_path = os.path.join(file_info['path'], file_info['filename'])
-            all_files_to_process.append((file_info, full_path))
+            
+            # Check cache first if enabled
+            if cache_path:
+                cache_key = _get_cache_key(full_path)
+                cached = cache_entries.get(cache_key)
+                if cached:
+                    try:
+                        file_stat = os.stat(full_path)
+                        if _is_cache_hit(cached, file_stat, args):
+                            # Cache hit - use cached MD5
+                            file_info['md5'] = cached['md5']
+                            file_info['md5_read_size'] = cached.get('md5_read_size', file_info['size'])
+                            
+                            # Group by MD5
+                            md5sum = cached['md5']
+                            if md5sum not in duplicate_files:
+                                duplicate_files[md5sum] = []
+                            duplicate_files[md5sum].append(file_info)
+                            
+                            cache_hits += 1
+                            hashed += 1
+                            processed += 1
+                            continue
+                    except OSError:
+                        pass  # File not accessible, will try to hash it
+                
+                cache_misses += 1
+            
+            files_needing_hash.append((file_info, full_path))
+    
+    if cache_path:
+        print(f"  Cache: {cache_hits} hits, {cache_misses} misses", flush=True)
+    
+    # Update count of files to hash
+    files_to_hash = len(files_needing_hash)
+    if cache_hits > 0:
+        print(f"  {files_to_hash} files still need MD5 computation after cache lookup", flush=True)
     
     # Compute MD5 (threaded or sequential)
-    if hash_threads > 0 and len(all_files_to_process) > 1:
+    if hash_threads > 0 and len(files_needing_hash) > 1:
         with ThreadPoolExecutor(max_workers=hash_threads) as executor:
             future_to_info = {
                 executor.submit(calculate_md5_with_stability_check, args, fp, fi['size']): (fi, fp)
-                for fi, fp in all_files_to_process
+                for fi, fp in files_needing_hash
             }
             
             for future in as_completed(future_to_info):
@@ -891,6 +1040,22 @@ def _find_duplicate_files_md5_size_first(args, files, total_files, progress_cb: 
                     if success:
                         file_info['md5'] = md5sum
                         file_info['md5_read_size'] = read_size
+                        
+                        # Update cache if enabled
+                        if cache_path:
+                            try:
+                                file_stat = os.stat(full_path)
+                                cache_key = _get_cache_key(full_path)
+                                cache_entries[cache_key] = {
+                                    'md5': md5sum,
+                                    'md5_read_size': read_size,
+                                    'size': file_stat.st_size,
+                                    'mtime_ns': getattr(file_stat, 'st_mtime_ns', int(file_stat.st_mtime * 1e9)),
+                                    'md5_mode': str(getattr(args, 'md5_mode', MD5Mode.DEFAULT)),
+                                    'md5_max_size': getattr(args, 'md5_max_size', 0) or 0,
+                                }
+                            except OSError:
+                                pass  # Could not stat file for cache
                         
                         # Group by MD5
                         if md5sum not in duplicate_files:
@@ -924,12 +1089,28 @@ def _find_duplicate_files_md5_size_first(args, files, total_files, progress_cb: 
                     processed += 1
     else:
         # Sequential processing
-        for file_info, full_path in all_files_to_process:
+        for file_info, full_path in files_needing_hash:
             md5sum, read_size, success, error_msg = calculate_md5_with_stability_check(args, full_path, file_info['size'])
             
             if success:
                 file_info['md5'] = md5sum
                 file_info['md5_read_size'] = read_size
+                
+                # Update cache if enabled
+                if cache_path:
+                    try:
+                        file_stat = os.stat(full_path)
+                        cache_key = _get_cache_key(full_path)
+                        cache_entries[cache_key] = {
+                            'md5': md5sum,
+                            'md5_read_size': read_size,
+                            'size': file_stat.st_size,
+                            'mtime_ns': getattr(file_stat, 'st_mtime_ns', int(file_stat.st_mtime * 1e9)),
+                            'md5_mode': str(getattr(args, 'md5_mode', MD5Mode.DEFAULT)),
+                            'md5_max_size': getattr(args, 'md5_max_size', 0) or 0,
+                        }
+                    except OSError:
+                        pass  # Could not stat file for cache
                 
                 # Group by MD5
                 if md5sum not in duplicate_files:
@@ -961,6 +1142,10 @@ def _find_duplicate_files_md5_size_first(args, files, total_files, progress_cb: 
         print(f"  Warning: {len(skipped_files)} files were skipped due to errors or instability", flush=True)
     
     print(f"  Hashed {hashed} files, found {sum(1 for g in duplicate_files.values() if len(g) > 1)} duplicate groups", flush=True)
+    
+    # Save updated cache if enabled (always write when cache option is used, even if empty)
+    if cache_path:
+        save_md5_cache(cache_path, cache_entries)
     
     # Final progress
     if progress_cb:

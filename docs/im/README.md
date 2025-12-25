@@ -13,6 +13,7 @@ Version 1.0
 7. [GUI Architecture](#gui-architecture)
 8. [JSON Export](#json-export)
 9. [Extending fdup](#extending-fdup)
+10. [Testing](#testing)
 
 ---
 
@@ -480,3 +481,243 @@ Example: 10,000 files scanned
 - 1,500 need MD5 computation -> hash only these
 Result: 85% reduction in I/O
 ```
+
+### MD5 Cache Implementation
+
+The `--md5-cache` option enables caching of MD5 hashes across runs.
+
+#### Cache Functions
+
+```python
+def load_md5_cache(cache_path: str) -> dict:
+    """Load cache from JSON file. Returns empty dict if file doesn't exist."""
+
+def save_md5_cache(cache_path: str, cache_entries: dict, verbose: bool = True) -> None:
+    """Save cache entries to JSON file."""
+
+def _get_cache_key(file_path: str) -> str:
+    """Normalize path for cache key (absolute, case-normalized)."""
+
+def _is_cache_hit(cache_entry: dict, file_stat, args) -> bool:
+    """Check if cached entry is valid for current file and settings."""
+```
+
+#### Cache Entry Structure
+
+Each cache entry contains:
+
+```python
+{
+    'md5': 'abc123...',           # Computed MD5 hash
+    'md5_read_size': 1234567,     # Bytes read during hashing
+    'size': 1234567,              # File size at hash time
+    'mtime_ns': 170354880000...,  # Modification time (nanoseconds)
+    'md5_mode': 'DEFAULT',        # MD5 mode used
+    'md5_max_size': 0,            # Max size setting used
+}
+```
+
+#### Cache Hit Criteria
+
+A cache entry is considered a "hit" if ALL of the following match:
+
+1. **Size**: `cache_entry['size'] == file_stat.st_size`
+2. **Modification time**: `cache_entry['mtime_ns'] == file_stat.st_mtime_ns`
+3. **MD5 mode**: `cache_entry['md5_mode'] == str(args.md5_mode)`
+4. **Max size**: `cache_entry['md5_max_size'] == args.md5_max_size`
+
+If any criterion fails, the entry is a cache miss and the file is re-hashed.
+
+#### Integration with Size-First
+
+The cache is integrated into Phase 2 of the size-first optimization:
+
+```python
+# In _find_duplicate_files_md5_size_first():
+for file_info in candidate_files:
+    if cache_path:
+        cache_key = _get_cache_key(full_path)
+        cached = cache_entries.get(cache_key)
+        if cached and _is_cache_hit(cached, file_stat, args):
+            # Use cached MD5 - skip hashing
+            file_info['md5'] = cached['md5']
+            cache_hits += 1
+            continue
+        cache_misses += 1
+    
+    # Hash file and update cache
+    md5sum, read_size = calculate_md5(...)
+    if cache_path:
+        cache_entries[cache_key] = {...}
+
+# Save updated cache at end
+if cache_path and cache_entries:
+    save_md5_cache(cache_path, cache_entries)
+```
+
+#### Performance Impact
+
+With caching enabled on repeated scans:
+
+```
+First scan: 1,500 files hashed (100% misses)
+Second scan: 1,500 files, 0 hashed (100% hits)
+Result: O(1) lookup instead of O(file_size) read
+```
+
+#### Thread Safety
+
+The current implementation is not fully thread-safe for cache writes. When using `--hash-threads`, cache updates happen after thread completion to avoid race conditions.
+
+---
+
+## Testing
+
+fdup uses pytest for automated testing. Tests are located in the `tests/` directory and generate temporary data in `tests/tests.work/`.
+
+### Prerequisites
+
+- Python 3.7+
+- pytest: `pip install pytest`
+
+### Test Output Directory
+
+All generated test data is written to:
+
+```
+tests/tests.work/generated/
+├── default/          # test_random_generated_default runs
+│   ├── run0/
+│   ├── run1/
+│   └── ...
+├── small/            # test_random_generated_small runs
+├── medium/           # test_random_generated_medium runs
+├── large/            # test_random_generated_large runs
+└── cache_test/       # test_md5_cache_* runs
+```
+
+This directory is created automatically and can be safely deleted to free space.
+
+### Pytest Markers
+
+| Marker | Description |
+|--------|-------------|
+| `fdup_all` | All fdup generated tests (default, small, medium, large, cache) |
+| `slow` | Tests that take a long time (medium, large suites) |
+
+### Running Tests
+
+> **Note:** The examples below use `python -m pytest` which works even if the `pytest` console script is not on your PATH. If you have `pytest` available as a command, you can also use `pytest ...` directly.
+
+#### Run all tests
+
+```bash
+python -m pytest
+```
+
+#### Run only fdup generated tests
+
+```bash
+python -m pytest -m fdup_all
+```
+
+#### Run tests excluding slow ones
+
+```bash
+python -m pytest -m "fdup_all and not slow"
+```
+
+#### Run only slow tests
+
+```bash
+python -m pytest -m slow
+```
+
+#### Run a specific test file
+
+```bash
+python -m pytest tests/test_md5_cache.py
+python -m pytest tests/test_random_generated_default.py
+python -m pytest tests/test_random_generated_suites.py
+```
+
+#### Run a specific test function
+
+```bash
+python -m pytest tests/test_md5_cache.py::test_md5_cache_basic
+python -m pytest tests/test_random_generated_suites.py::test_random_generated_small
+```
+
+#### Run a specific parametrized test case
+
+```bash
+# Run only run index 3 of the default test
+python -m pytest tests/test_random_generated_default.py::test_random_generated_default[3]
+
+# Run only run index 5 of the small suite
+python -m pytest tests/test_random_generated_suites.py::test_random_generated_small[5]
+```
+
+#### Override the base seed for suite tests
+
+Suite tests (`small`, `medium`, `large`) use a deterministic base seed that can be overridden:
+
+```bash
+# Linux/macOS
+export FDUP_TEST_SEED=99999
+python -m pytest -m fdup_all
+
+# Windows PowerShell
+$env:FDUP_TEST_SEED = "99999"
+python -m pytest -m fdup_all
+
+# Windows CMD
+set FDUP_TEST_SEED=99999
+python -m pytest -m fdup_all
+```
+
+### Tests Available
+
+#### `tests/test_random_generated_default.py`
+
+| Test | Description |
+|------|-------------|
+| `test_random_generated_default[0..9]` | Generates a random directory tree using `bin/random_tree_gen.py` with default parameters and seed = run index (0..9). Runs `fdup.py -c MD5` and verifies the found duplicates match the manifest. Dup percent is randomized per seed (15-40%). |
+
+#### `tests/test_random_generated_suites.py`
+
+| Test | Description |
+|------|-------------|
+| `test_random_generated_small[0..9]` | Generates 500-1000 files with small file sizes. Validates fdup MD5 results against manifest. |
+| `test_random_generated_medium[0..9]` | *(slow)* Generates 2000-4000 files with medium file sizes. Validates fdup MD5 results against manifest. |
+| `test_random_generated_large[0..9]` | *(slow)* Generates 5000-10000 files with large file sizes. Validates fdup MD5 results against manifest. |
+
+Suite parameters are derived deterministically from `(suite_name, run_idx, FDUP_TEST_SEED)`.
+
+#### `tests/test_md5_cache.py`
+
+| Test | Description |
+|------|-------------|
+| `test_md5_cache_basic` | Verifies cache file is created with correct structure (version, entries). Runs fdup twice and confirms second run uses cached hashes. Validates results match manifest both times. |
+| `test_md5_cache_invalidation` | Modifies a file after initial cache population. Confirms fdup detects the change and re-hashes the modified file. |
+| `test_md5_cache_default_filename` | Tests that `--md5-cache` without a filename uses the default `fdup_md5_cache.json`. |
+
+### Helper Modules
+
+#### `tests/conftest.py`
+
+Provides pytest fixtures:
+
+| Fixture | Scope | Description |
+|---------|-------|-------------|
+| `repo_root` | session | Returns `Path` to repository root |
+| `work_root` | session | Returns `Path` to `tests/tests.work/` (creates if missing) |
+
+Also provides `run_script(script_path, *args, cwd)` helper to execute Python scripts.
+
+#### `tests/compare_duplicates.py`
+
+Compares `manifest.json` (ground truth from `random_tree_gen.py`) against fdup JSON output.
+
+- `compare_manifest_vs_fdup(manifest_path, fdup_json_path)`: Raises `AssertionError` if duplicate groups don't match.
+- CLI usage: `python -m tests.compare_duplicates <manifest.json> <fdup_json>`

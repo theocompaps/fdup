@@ -19,6 +19,7 @@ from fdup.fduplib import (
     save_uniques_to_json,
     export_cleanup_to_script,
     DEFAULT_CONFIG_FILENAME,
+    DEFAULT_MD5_CACHE_FILENAME,
     load_scan_config,
     save_scan_config,
     args_to_scan_config_dict,
@@ -136,6 +137,11 @@ def configure_option_parser(argv=None):
     # Stability check option (MD5 mode only)
     parser.add_argument("--require-stable", dest="require_stable", action="store_true",
                         help="Check file stability during MD5 hashing: skip files that change during read (size/mtime). Only used with -c MD5.")
+    
+    # MD5 cache option (opt-in, MD5 mode only)
+    parser.add_argument("--md5-cache", dest="md5_cache", nargs='?', const=DEFAULT_MD5_CACHE_FILENAME, default=None,
+                        metavar="FILENAME",
+                        help=f"Enable MD5 cache for repeated scans (opt-in). Caches MD5 hashes to speed up subsequent scans. Default filename: {DEFAULT_MD5_CACHE_FILENAME}. Only used with -c MD5.")
 
     args = parser.parse_args(argv)
     
@@ -254,20 +260,7 @@ def main():
         if args.compare_mode == CompareMode.MD5 and args.md5_max_size > 0:
             print("MD5 Utilization - Min: " + str(md5_coverage_min) + ' Max: ' + str(md5_coverage_max), flush=True)
 
-        # Handle JSON export (new options take precedence over deprecated ones)
-        if args.exportdup2json is not None:
-            save_duplicates_to_json(args, duplicate_files, args.exportdup2json)
-        elif args.save2json:
-            # Deprecated option
-            save_duplicates_to_json(args, duplicate_files, args.json_filename)
-        
-        if args.exportuni2json is not None:
-            save_uniques_to_json(args, duplicate_files, args.exportuni2json)
-        elif args.save_unique:
-            # Deprecated option
-            save_uniques_to_json(args, duplicate_files, args.json_unique_filename)
-        
-        # Handle cleanup script export
+        # Handle cleanup script export (only if duplicates exist)
         if args.exportcu2script is not None:
             # Adjust default filename based on script type if user used default
             script_filename = args.exportcu2script
@@ -276,6 +269,19 @@ def main():
             export_cleanup_to_script(args, duplicate_files, script_filename, args.script_type)
     else:
         print("No duplicate files found.", flush=True)
+    
+    # Handle JSON export (always write when requested, even if empty)
+    if args.exportdup2json is not None:
+        save_duplicates_to_json(args, duplicate_files, args.exportdup2json)
+    elif args.save2json:
+        # Deprecated option
+        save_duplicates_to_json(args, duplicate_files, args.json_filename)
+    
+    if args.exportuni2json is not None:
+        save_uniques_to_json(args, duplicate_files, args.exportuni2json)
+    elif args.save_unique:
+        # Deprecated option
+        save_uniques_to_json(args, duplicate_files, args.json_unique_filename)
 
 if __name__ == "__main__":
     main()
