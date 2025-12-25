@@ -219,9 +219,15 @@ def save_scan_config(filename, cfg_dict, verbose=True):
         print(f"Configuration saved to {filename}", flush=True)
 
 
-def get_file_info(args, dir_path, file_path):
+def get_file_info(args, dir_path, file_path, skip_md5: bool = False):
     """
     Get file information: filename, size, and optionally MD5 checksum.
+    
+    Args:
+        args: Parsed arguments
+        dir_path: Directory containing the file
+        file_path: Full path to the file
+        skip_md5: If True, skip MD5 computation even in MD5 mode (for size-first optimization)
     """
     file_info = {
         'path': dir_path,
@@ -229,7 +235,7 @@ def get_file_info(args, dir_path, file_path):
         'size': os.path.getsize(file_path)
     }
 
-    if args.compare_mode == CompareMode.MD5:
+    if args.compare_mode == CompareMode.MD5 and not skip_md5:
         (md5sum, read_size) = calculate_md5(args, file_path, os.path.getsize(file_path))
 
         file_info['md5'] = md5sum
@@ -238,29 +244,41 @@ def get_file_info(args, dir_path, file_path):
     return file_info
 
 
+def get_file_info_metadata_only(dir_path, file_path):
+    """
+    Get file metadata only (path, filename, size) without any hashing.
+    
+    Used for the first phase of size-first duplicate detection.
+    """
+    return {
+        'path': dir_path,
+        'filename': os.path.basename(file_path),
+        'size': os.path.getsize(file_path),
+        'full_path': file_path,  # Store for later MD5 computation
+    }
+
+
 def calculate_md5(args, file_path, file_size):
     """
     Calculate MD5 checksum for a file.
+    
+    Always uses chunked reads to avoid loading entire file into RAM.
     """
 
     if args.md5_mode == MD5Mode.DEFAULT:
         read_size = 0
+        block_size = getattr(args, 'md5_block_size', 4096) or 4096
+        max_size_bytes = (getattr(args, 'md5_max_size', 0) or 0) * 1024
 
         md5 = hashlib.md5()
         with open(file_path, 'rb') as file:
-            if args.md5_max_size > 0:
-                for cnt_chunk, chunk in enumerate(iter(lambda: file.read(args.md5_block_size), b"")):
-                    md5.update(chunk)
+            for chunk in iter(lambda: file.read(block_size), b""):
+                md5.update(chunk)
+                read_size += len(chunk)
 
-                    read_size = cnt_chunk*args.md5_block_size
-
-                    # Stop after md5_max_size if enabled
-                    if args.md5_max_size > 0 and cnt_chunk*args.md5_block_size > (args.md5_max_size*1024):
-                        file.close()
-                        break
-            else:
-                read_size = os.path.getsize(file_path)
-                md5.update(file.read())
+                # Stop after md5_max_size if enabled
+                if max_size_bytes > 0 and read_size >= max_size_bytes:
+                    break
 
         return (md5.hexdigest(), read_size)
     elif args.md5_mode == MD5Mode.MD5SUM:
@@ -389,13 +407,16 @@ def find_files_default(args, root_directories, progress_cb: Optional[ProgressCal
         
         print(f"Discovery complete: {count_directories} dirs, {len(candidate_paths)} matching files", flush=True)
         
+        # For MD5 mode, skip MD5 computation during scan (size-first optimization)
+        skip_md5_in_scan = (args.compare_mode == CompareMode.MD5)
+        
         # Process file info (stat + optional MD5) - threaded or sequential
         if num_threads > 0 and len(candidate_paths) > 0:
             print(f"Processing file info with {num_threads} threads...", flush=True)
             with ThreadPoolExecutor(max_workers=num_threads) as executor:
                 # Submit all tasks
                 future_to_path = {
-                    executor.submit(get_file_info, args, dir_path, file_path): (dir_path, file_path)
+                    executor.submit(get_file_info, args, dir_path, file_path, skip_md5_in_scan): (dir_path, file_path)
                     for dir_path, file_path in candidate_paths
                 }
                 
@@ -403,6 +424,10 @@ def find_files_default(args, root_directories, progress_cb: Optional[ProgressCal
                 for future in as_completed(future_to_path):
                     try:
                         file_info = future.result()
+                        # Store full_path for later MD5 computation in MD5 mode
+                        if skip_md5_in_scan:
+                            dir_path, file_path = future_to_path[future]
+                            file_info['full_path'] = file_path
                         files[root_dir].append(file_info)
                         count_matched += 1
                         
@@ -426,7 +451,10 @@ def find_files_default(args, root_directories, progress_cb: Optional[ProgressCal
             # Sequential processing (original behavior)
             for dir_path, file_path in candidate_paths:
                 try:
-                    file_info = get_file_info(args, dir_path, file_path)
+                    file_info = get_file_info(args, dir_path, file_path, skip_md5_in_scan)
+                    # Store full_path for later MD5 computation in MD5 mode
+                    if skip_md5_in_scan:
+                        file_info['full_path'] = file_path
                     files[root_dir].append(file_info)
                     count_matched += 1
                     
@@ -556,13 +584,16 @@ def find_files_find(args, root_directories, progress_cb: Optional[ProgressCallba
         print('Find found: ' + str(len(file_paths)) + ' files and ' + str(count_directories) + ' directories', flush=True)
         print('Getting file info and optionally computing the MD5 for each file', flush=True)
 
+        # For MD5 mode, skip MD5 computation during scan (size-first optimization)
+        skip_md5_in_scan = (args.compare_mode == CompareMode.MD5)
+
         # Process file info (stat + optional MD5) - threaded or sequential
         if num_threads > 0 and len(file_paths) > 0:
             print(f"Processing file info with {num_threads} threads...", flush=True)
             with ThreadPoolExecutor(max_workers=num_threads) as executor:
                 # Submit all tasks
                 future_to_path = {
-                    executor.submit(get_file_info, args, os.path.dirname(fp), fp): fp
+                    executor.submit(get_file_info, args, os.path.dirname(fp), fp, skip_md5_in_scan): fp
                     for fp in file_paths
                 }
                 
@@ -570,6 +601,9 @@ def find_files_find(args, root_directories, progress_cb: Optional[ProgressCallba
                 for future in as_completed(future_to_path):
                     try:
                         file_info = future.result()
+                        # Store full_path for later MD5 computation in MD5 mode
+                        if skip_md5_in_scan:
+                            file_info['full_path'] = future_to_path[future]
                         files[root_dir].append(file_info)
                         count_files += 1
                         
@@ -594,7 +628,10 @@ def find_files_find(args, root_directories, progress_cb: Optional[ProgressCallba
             for file_path in file_paths:
                 try:
                     (dir_path, file_name) = os.path.split(file_path)
-                    file_info = get_file_info(args, dir_path, file_path)
+                    file_info = get_file_info(args, dir_path, file_path, skip_md5_in_scan)
+                    # Store full_path for later MD5 computation in MD5 mode
+                    if skip_md5_in_scan:
+                        file_info['full_path'] = file_path
                     files[root_dir].append(file_info)
                     count_files += 1
 
@@ -637,16 +674,25 @@ def find_duplicate_files(args, files, progress_cb: Optional[ProgressCallback] = 
     """
     Find duplicate files by grouping them based on compare mode.
     
+    For MD5 mode, uses size-first optimization:
+    1. Group all files by size globally
+    2. Only compute MD5 for files in size groups with >1 file
+    3. Group by MD5 to find true duplicates
+    
     Args:
         args: Parsed arguments
         files: Dictionary of root_dir -> list of file_info dicts
         progress_cb: Optional callback for progress reporting
     """
-    # Find duplicates within a root directory
-    duplicate_files = dict()
-    
     # Calculate total for progress reporting
     total_files = sum(len(files[root_dir]) for root_dir in files)
+    
+    # For MD5 mode, use size-first optimization
+    if args.compare_mode == CompareMode.MD5:
+        return _find_duplicate_files_md5_size_first(args, files, total_files, progress_cb)
+    
+    # For NAME and NAMESIZE modes, use original algorithm
+    duplicate_files = dict()
     processed = 0
 
     for root_dir in files:
@@ -657,10 +703,9 @@ def find_duplicate_files(args, files, progress_cb: Optional[ProgressCallback] = 
                 fileid = file_info['filename']
             elif args.compare_mode == CompareMode.NAMESIZE:
                 fileid = (file_info['filename'], file_info['size'])
-            elif args.compare_mode == CompareMode.MD5:
-                fileid = file_info['md5']
             else:
                 print("Cannot handle compare mode:" + str(args.compare_mode), flush=True)
+                continue
 
             if fileid not in duplicate_files:
                 duplicate_files[fileid] = list()
@@ -684,6 +729,137 @@ def find_duplicate_files(args, files, progress_cb: Optional[ProgressCallback] = 
             total=total_files
         ))
 
+    return duplicate_files
+
+
+def _find_duplicate_files_md5_size_first(args, files, total_files, progress_cb: Optional[ProgressCallback] = None):
+    """
+    Find duplicate files using size-first MD5 optimization.
+    
+    1. Group all files by size globally across all roots
+    2. Filter to only size groups with >1 file (potential duplicates)
+    3. Compute MD5 only for those candidate files
+    4. Group by MD5 to find true duplicates
+    
+    This dramatically reduces the number of files that need to be hashed,
+    especially useful for network shares where reading is expensive.
+    """
+    print("MD5 mode: Using size-first optimization", flush=True)
+    
+    # Phase 1: Group all files by size globally
+    print("Phase 1: Grouping files by size...", flush=True)
+    size_groups: dict[int, list] = {}
+    
+    for root_dir in files:
+        for file_info in files[root_dir]:
+            size = file_info['size']
+            if size not in size_groups:
+                size_groups[size] = []
+            size_groups[size].append(file_info)
+    
+    # Filter to only size groups with potential duplicates (>1 file)
+    candidate_groups = {size: group for size, group in size_groups.items() if len(group) > 1}
+    
+    # Count files that need hashing
+    files_to_hash = sum(len(group) for group in candidate_groups.values())
+    unique_by_size = total_files - files_to_hash
+    
+    print(f"  {len(size_groups)} unique sizes, {len(candidate_groups)} sizes with potential duplicates", flush=True)
+    print(f"  {unique_by_size} files unique by size (skipping MD5)", flush=True)
+    print(f"  {files_to_hash} files need MD5 computation", flush=True)
+    
+    # Phase 2: Compute MD5 only for candidate files
+    print("Phase 2: Computing MD5 for candidate files...", flush=True)
+    duplicate_files: dict[str, list] = {}
+    processed = 0
+    hashed = 0
+    
+    # Get thread count for MD5 computation
+    num_threads = getattr(args, 'threads', 0) or 0
+    
+    for size, group in candidate_groups.items():
+        # Collect file paths for hashing
+        files_to_process = []
+        for file_info in group:
+            full_path = file_info.get('full_path')
+            if full_path:
+                files_to_process.append((file_info, full_path))
+            else:
+                # Fallback: reconstruct path
+                full_path = os.path.join(file_info['path'], file_info['filename'])
+                files_to_process.append((file_info, full_path))
+        
+        # Compute MD5 (threaded or sequential)
+        if num_threads > 0 and len(files_to_process) > 1:
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                future_to_info = {
+                    executor.submit(calculate_md5, args, fp, fi['size']): fi
+                    for fi, fp in files_to_process
+                }
+                
+                for future in as_completed(future_to_info):
+                    file_info = future_to_info[future]
+                    try:
+                        md5sum, read_size = future.result()
+                        file_info['md5'] = md5sum
+                        file_info['md5_read_size'] = read_size
+                        
+                        # Group by MD5
+                        if md5sum not in duplicate_files:
+                            duplicate_files[md5sum] = []
+                        duplicate_files[md5sum].append(file_info)
+                        
+                        hashed += 1
+                        processed += 1
+                        
+                        if progress_cb and hashed % 250 == 0:
+                            progress_cb(ProgressEvent(
+                                stage="dups",
+                                processed=processed + unique_by_size,
+                                total=total_files
+                            ))
+                    except Exception as e:
+                        print(f"  Warning: Failed to hash {file_info['filename']}: {e}", flush=True)
+                        processed += 1
+        else:
+            # Sequential processing
+            for file_info, full_path in files_to_process:
+                try:
+                    md5sum, read_size = calculate_md5(args, full_path, file_info['size'])
+                    file_info['md5'] = md5sum
+                    file_info['md5_read_size'] = read_size
+                    
+                    # Group by MD5
+                    if md5sum not in duplicate_files:
+                        duplicate_files[md5sum] = []
+                    duplicate_files[md5sum].append(file_info)
+                    
+                    hashed += 1
+                    processed += 1
+                    
+                    if progress_cb and hashed % 250 == 0:
+                        progress_cb(ProgressEvent(
+                            stage="dups",
+                            processed=processed + unique_by_size,
+                            total=total_files
+                        ))
+                    
+                    if hashed % 1000 == 0:
+                        print(f"  Status: Hashed {hashed}/{files_to_hash} files", flush=True)
+                except Exception as e:
+                    print(f"  Warning: Failed to hash {file_info['filename']}: {e}", flush=True)
+                    processed += 1
+    
+    print(f"  Hashed {hashed} files, found {sum(1 for g in duplicate_files.values() if len(g) > 1)} duplicate groups", flush=True)
+    
+    # Final progress
+    if progress_cb:
+        progress_cb(ProgressEvent(
+            stage="dups",
+            processed=total_files,
+            total=total_files
+        ))
+    
     return duplicate_files
 
 
