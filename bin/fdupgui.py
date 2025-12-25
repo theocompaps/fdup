@@ -304,7 +304,19 @@ class FdupGuiWindow(QMainWindow):
         self.threads_spin.setValue(0)  # Default: off
         self.threads_spin.setSpecialValueText("Off")
         threads_form.addRow("Threads:", self.threads_spin)
+        
+        # Hash Threads spinbox (MD5 mode only)
+        self.hash_threads_spin = QSpinBox()
+        self.hash_threads_spin.setRange(0, 32)
+        self.hash_threads_spin.setValue(0)  # Default: use threads value
+        self.hash_threads_spin.setSpecialValueText("Use Threads")
+        threads_form.addRow("Hash Threads:", self.hash_threads_spin)
         layout.addLayout(threads_form)
+        
+        # Require Stable checkbox (MD5 mode only)
+        self.require_stable_checkbox = QCheckBox("Require stable files (MD5 only)")
+        self.require_stable_checkbox.setToolTip("Skip files that change during hashing (checks size/mtime before and after)")
+        layout.addWidget(self.require_stable_checkbox)
         
         # Script Type dropdown (for cleanup export)
         script_form = QFormLayout()
@@ -569,6 +581,8 @@ class FdupGuiWindow(QMainWindow):
             iregex=self.iregex_checkbox.isChecked(),
             directories=root_dirs,
             threads=self.threads_spin.value(),
+            hash_threads=self.hash_threads_spin.value(),
+            require_stable=self.require_stable_checkbox.isChecked(),
             save2json=False,
             save_unique=False,
             json_filename="duplicate_files.json",
@@ -611,6 +625,10 @@ class FdupGuiWindow(QMainWindow):
         self.md5_mode_combo.setEnabled(is_md5)
         self.md5_block_size_spin.setEnabled(is_md5)
         self.md5_max_size_spin.setEnabled(is_md5)
+        self.hash_threads_spin.setEnabled(is_md5)
+        self.require_stable_checkbox.setEnabled(is_md5)
+        if not is_md5:
+            self.require_stable_checkbox.setChecked(False)
     
     def _update_iregex_enabled(self):
         """Enable or disable iregex checkbox based on find mode and GNU find availability."""
@@ -895,6 +913,14 @@ class FdupGuiWindow(QMainWindow):
             if 'threads' in cfg:
                 self.threads_spin.setValue(cfg['threads'])
             
+            # Populate hash_threads
+            if 'hash_threads' in cfg:
+                self.hash_threads_spin.setValue(cfg['hash_threads'])
+            
+            # Populate require_stable
+            if 'require_stable' in cfg:
+                self.require_stable_checkbox.setChecked(cfg['require_stable'])
+            
             self.output_text.appendPlainText(f"Configuration loaded from {filename}")
             
         except FileNotFoundError:
@@ -959,6 +985,12 @@ class FdupGuiWindow(QMainWindow):
         
         # Threads
         cfg['threads'] = self.threads_spin.value()
+        
+        # Hash Threads
+        cfg['hash_threads'] = self.hash_threads_spin.value()
+        
+        # Require Stable
+        cfg['require_stable'] = self.require_stable_checkbox.isChecked()
         
         return cfg
 

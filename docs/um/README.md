@@ -118,6 +118,8 @@ python bin/fdup.py [OPTIONS] DIRECTORY [DIRECTORY ...]
 | `--md5_mode` | MD5 calculation method: `DEFAULT`, `MD5SUM` |
 | `--md5_block_size` | Block size in bytes for reading files (default: 4096) |
 | `--md5_max_size` | Maximum KB to read for MD5 (0 = full file) |
+| `--hash-threads N` | Number of threads for MD5 hashing (0 = use --threads value) |
+| `--require-stable` | Skip files that change during MD5 hashing (checks size/mtime) |
 
 #### Pattern Options
 
@@ -471,6 +473,17 @@ MD5 mode reads file contents, which is slow for large files.
 **Solutions:**
 - Use `--md5_max_size` to limit how much of each file is read
 - Use NAMESIZE mode as a pre-filter
+- Use `--threads N` or `--hash-threads N` to parallelize file processing and hashing (useful for network shares)
+
+### Files skipped due to instability
+
+When using `--require-stable`, files that change during hashing are skipped.
+
+**Cause:** A file's size or modification time changed between the start and end of hashing, indicating the file is being actively modified.
+
+**Solutions:**
+- Wait for file transfers or writes to complete before scanning
+- Remove the `--require-stable` flag if you don't need stability checks
 
 ### GUI "Clear Required" message
 

@@ -16,9 +16,10 @@ import re
 import subprocess
 import shlex
 import shutil
+import time
 from enum import Enum
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -97,6 +98,9 @@ SCAN_CONFIG_KEYS = [
     'include_patterns',
     'iregex',
     'script_type',
+    'threads',
+    'hash_threads',
+    'require_stable',
 ]
 
 
@@ -141,6 +145,15 @@ def args_to_scan_config_dict(args):
     if hasattr(args, 'script_type') and args.script_type:
         config['script_type'] = str(args.script_type)
     
+    if hasattr(args, 'threads'):
+        config['threads'] = args.threads
+    
+    if hasattr(args, 'hash_threads'):
+        config['hash_threads'] = args.hash_threads
+    
+    if hasattr(args, 'require_stable'):
+        config['require_stable'] = args.require_stable
+    
     return config
 
 
@@ -182,6 +195,15 @@ def apply_scan_config_dict_to_args(args, cfg_dict):
     
     if 'script_type' in cfg_dict:
         args.script_type = ScriptType[cfg_dict['script_type']]
+    
+    if 'threads' in cfg_dict:
+        args.threads = cfg_dict['threads']
+    
+    if 'hash_threads' in cfg_dict:
+        args.hash_threads = cfg_dict['hash_threads']
+    
+    if 'require_stable' in cfg_dict:
+        args.require_stable = cfg_dict['require_stable']
     
     return args
 
@@ -256,6 +278,64 @@ def get_file_info_metadata_only(dir_path, file_path):
         'size': os.path.getsize(file_path),
         'full_path': file_path,  # Store for later MD5 computation
     }
+
+
+def calculate_md5_with_stability_check(args, file_path, file_size) -> Tuple[str, int, bool, str]:
+    """
+    Calculate MD5 checksum for a file with optional stability check and retry logic.
+    
+    Args:
+        args: Parsed arguments
+        file_path: Path to file
+        file_size: Expected file size
+        
+    Returns:
+        Tuple of (md5_hash, read_size, success, error_message)
+        - success is False if file changed during hashing (when require_stable is True)
+        - error_message contains details if success is False
+    """
+    require_stable = getattr(args, 'require_stable', False)
+    max_retries = 3
+    retry_delay = 0.5  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # Get initial stats for stability check
+            if require_stable:
+                try:
+                    stat_before = os.stat(file_path)
+                    size_before = stat_before.st_size
+                    mtime_before = stat_before.st_mtime
+                except OSError as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay)
+                        continue
+                    return ("", 0, False, f"Failed to stat file: {e}")
+            
+            # Calculate MD5
+            md5_hash, read_size = calculate_md5(args, file_path, file_size)
+            
+            # Check stability after hashing
+            if require_stable:
+                try:
+                    stat_after = os.stat(file_path)
+                    size_after = stat_after.st_size
+                    mtime_after = stat_after.st_mtime
+                    
+                    if size_before != size_after or mtime_before != mtime_after:
+                        return ("", 0, False, f"File changed during hashing (size: {size_before}->{size_after}, mtime: {mtime_before}->{mtime_after})")
+                except OSError as e:
+                    return ("", 0, False, f"Failed to verify file stability: {e}")
+            
+            return (md5_hash, read_size, True, "")
+            
+        except (OSError, IOError) as e:
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                continue
+            return ("", 0, False, f"Failed to read file after {max_retries} attempts: {e}")
+    
+    return ("", 0, False, "Unexpected error in MD5 calculation")
 
 
 def calculate_md5(args, file_path, file_size):
@@ -771,36 +851,44 @@ def _find_duplicate_files_md5_size_first(args, files, total_files, progress_cb: 
     # Phase 2: Compute MD5 only for candidate files
     print("Phase 2: Computing MD5 for candidate files...", flush=True)
     duplicate_files: dict[str, list] = {}
+    skipped_files: list = []  # Track files that failed or changed during hashing
     processed = 0
     hashed = 0
     
-    # Get thread count for MD5 computation
-    num_threads = getattr(args, 'threads', 0) or 0
+    # Get thread count for MD5 computation (hash_threads takes precedence over threads)
+    hash_threads = getattr(args, 'hash_threads', 0) or 0
+    if hash_threads == 0:
+        hash_threads = getattr(args, 'threads', 0) or 0
     
+    require_stable = getattr(args, 'require_stable', False)
+    if require_stable:
+        print("  Stability check enabled: files that change during hashing will be skipped", flush=True)
+    if hash_threads > 0:
+        print(f"  Using {hash_threads} threads for hashing", flush=True)
+    
+    # Flatten all candidate files for batch processing
+    all_files_to_process = []
     for size, group in candidate_groups.items():
-        # Collect file paths for hashing
-        files_to_process = []
         for file_info in group:
             full_path = file_info.get('full_path')
-            if full_path:
-                files_to_process.append((file_info, full_path))
-            else:
-                # Fallback: reconstruct path
+            if not full_path:
                 full_path = os.path.join(file_info['path'], file_info['filename'])
-                files_to_process.append((file_info, full_path))
-        
-        # Compute MD5 (threaded or sequential)
-        if num_threads > 0 and len(files_to_process) > 1:
-            with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                future_to_info = {
-                    executor.submit(calculate_md5, args, fp, fi['size']): fi
-                    for fi, fp in files_to_process
-                }
-                
-                for future in as_completed(future_to_info):
-                    file_info = future_to_info[future]
-                    try:
-                        md5sum, read_size = future.result()
+            all_files_to_process.append((file_info, full_path))
+    
+    # Compute MD5 (threaded or sequential)
+    if hash_threads > 0 and len(all_files_to_process) > 1:
+        with ThreadPoolExecutor(max_workers=hash_threads) as executor:
+            future_to_info = {
+                executor.submit(calculate_md5_with_stability_check, args, fp, fi['size']): (fi, fp)
+                for fi, fp in all_files_to_process
+            }
+            
+            for future in as_completed(future_to_info):
+                file_info, full_path = future_to_info[future]
+                try:
+                    md5sum, read_size, success, error_msg = future.result()
+                    
+                    if success:
                         file_info['md5'] = md5sum
                         file_info['md5_read_size'] = read_size
                         
@@ -810,45 +898,67 @@ def _find_duplicate_files_md5_size_first(args, files, total_files, progress_cb: 
                         duplicate_files[md5sum].append(file_info)
                         
                         hashed += 1
-                        processed += 1
-                        
-                        if progress_cb and hashed % 250 == 0:
-                            progress_cb(ProgressEvent(
-                                stage="dups",
-                                processed=processed + unique_by_size,
-                                total=total_files
-                            ))
-                    except Exception as e:
-                        print(f"  Warning: Failed to hash {file_info['filename']}: {e}", flush=True)
-                        processed += 1
-        else:
-            # Sequential processing
-            for file_info, full_path in files_to_process:
-                try:
-                    md5sum, read_size = calculate_md5(args, full_path, file_info['size'])
-                    file_info['md5'] = md5sum
-                    file_info['md5_read_size'] = read_size
+                    else:
+                        skipped_files.append({
+                            'path': file_info['path'],
+                            'filename': file_info['filename'],
+                            'reason': error_msg
+                        })
+                        print(f"  Skipped: {file_info['filename']}: {error_msg}", flush=True)
                     
-                    # Group by MD5
-                    if md5sum not in duplicate_files:
-                        duplicate_files[md5sum] = []
-                    duplicate_files[md5sum].append(file_info)
-                    
-                    hashed += 1
                     processed += 1
                     
-                    if progress_cb and hashed % 250 == 0:
+                    if progress_cb and processed % 250 == 0:
                         progress_cb(ProgressEvent(
                             stage="dups",
                             processed=processed + unique_by_size,
                             total=total_files
                         ))
-                    
-                    if hashed % 1000 == 0:
-                        print(f"  Status: Hashed {hashed}/{files_to_hash} files", flush=True)
                 except Exception as e:
+                    skipped_files.append({
+                        'path': file_info['path'],
+                        'filename': file_info['filename'],
+                        'reason': str(e)
+                    })
                     print(f"  Warning: Failed to hash {file_info['filename']}: {e}", flush=True)
                     processed += 1
+    else:
+        # Sequential processing
+        for file_info, full_path in all_files_to_process:
+            md5sum, read_size, success, error_msg = calculate_md5_with_stability_check(args, full_path, file_info['size'])
+            
+            if success:
+                file_info['md5'] = md5sum
+                file_info['md5_read_size'] = read_size
+                
+                # Group by MD5
+                if md5sum not in duplicate_files:
+                    duplicate_files[md5sum] = []
+                duplicate_files[md5sum].append(file_info)
+                
+                hashed += 1
+            else:
+                skipped_files.append({
+                    'path': file_info['path'],
+                    'filename': file_info['filename'],
+                    'reason': error_msg
+                })
+                print(f"  Skipped: {file_info['filename']}: {error_msg}", flush=True)
+            
+            processed += 1
+            
+            if progress_cb and processed % 250 == 0:
+                progress_cb(ProgressEvent(
+                    stage="dups",
+                    processed=processed + unique_by_size,
+                    total=total_files
+                ))
+            
+            if processed % 1000 == 0:
+                print(f"  Status: Processed {processed}/{files_to_hash} files", flush=True)
+    
+    if skipped_files:
+        print(f"  Warning: {len(skipped_files)} files were skipped due to errors or instability", flush=True)
     
     print(f"  Hashed {hashed} files, found {sum(1 for g in duplicate_files.values() if len(g) > 1)} duplicate groups", flush=True)
     

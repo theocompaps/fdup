@@ -127,9 +127,15 @@ def configure_option_parser(argv=None):
     parser.add_argument("--progress", action="store_true",
                         help="Enable progress reporting (shows live counts during scan and duplicate detection)")
     
-    # Threading option
+    # Threading options
     parser.add_argument("--threads", type=int, default=0, metavar="N",
                         help="Number of threads for file processing (0 = disabled, default: 0). Useful for network shares with MD5 mode.")
+    parser.add_argument("--hash-threads", dest="hash_threads", type=int, default=0, metavar="N",
+                        help="Number of threads for MD5 hashing (0 = use --threads value, default: 0). Only used with -c MD5.")
+    
+    # Stability check option (MD5 mode only)
+    parser.add_argument("--require-stable", dest="require_stable", action="store_true",
+                        help="Check file stability during MD5 hashing: skip files that change during read (size/mtime). Only used with -c MD5.")
 
     args = parser.parse_args(argv)
     

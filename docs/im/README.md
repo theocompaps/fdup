@@ -211,6 +211,53 @@ def calculate_md5(args, file_path, file_size):
         return result.stdout.split()[0]
 ```
 
+### MD5 Stability Check
+
+When `--require-stable` is enabled, the `calculate_md5_with_stability_check()` function wraps MD5 calculation with file stability verification:
+
+```python
+def calculate_md5_with_stability_check(args, file_path, file_size) -> Tuple[str, int, bool, str]:
+    """
+    Returns (md5_hash, read_size, success, error_message)
+    """
+    if args.require_stable:
+        # Get stats before hashing
+        stat_before = os.stat(file_path)
+        size_before, mtime_before = stat_before.st_size, stat_before.st_mtime
+        
+    md5_hash, read_size = calculate_md5(args, file_path, file_size)
+    
+    if args.require_stable:
+        # Verify file didn't change during hashing
+        stat_after = os.stat(file_path)
+        if size_before != stat_after.st_size or mtime_before != stat_after.st_mtime:
+            return ("", 0, False, "File changed during hashing")
+    
+    return (md5_hash, read_size, True, "")
+```
+
+The function includes retry logic (3 attempts with 0.5s delay) for handling transient file access errors.
+
+### Threading Options
+
+Two threading options control parallelism:
+
+- **`--threads N`**: Controls threading for Phase 1 (file discovery and stat)
+- **`--hash-threads N`**: Controls threading for Phase 2 (MD5 hashing only)
+
+If `--hash-threads` is 0 (default), it uses the `--threads` value. This allows using different thread counts for discovery vs. hashing.
+
+```python
+# In _find_duplicate_files_md5_size_first():
+hash_threads = getattr(args, 'hash_threads', 0) or 0
+if hash_threads == 0:
+    hash_threads = getattr(args, 'threads', 0) or 0
+
+if hash_threads > 0:
+    with ThreadPoolExecutor(max_workers=hash_threads) as executor:
+        # Parallel MD5 computation
+```
+
 ---
 
 ## Compare Modes Implementation
@@ -407,7 +454,29 @@ def save_duplicates_to_csv(args, duplicate_files, filename):
 ### Performance Optimization
 
 Consider:
-- **Parallel MD5 calculation**: Use `multiprocessing` or `concurrent.futures`
+- **Parallel MD5 calculation**: Use `multiprocessing` or `concurrent.futures` (implemented via `--threads` and `--hash-threads`)
 - **Streaming results**: Yield duplicates as found instead of collecting all
-- **Pre-filtering by size**: Only calculate MD5 for files with matching sizes
+- **Pre-filtering by size**: Only calculate MD5 for files with matching sizes (implemented in MD5 mode)
 - **Caching**: Store MD5 hashes for unchanged files
+- **Stability checks**: Use `--require-stable` to skip files being modified during scan
+
+### Size-First Optimization (MD5 Mode)
+
+When using MD5 mode, fdup now uses a two-phase approach:
+
+**Phase 1: Group by Size**
+- Collect file metadata (path, filename, size) without computing MD5
+- Group files by size across all root directories
+- Files with unique sizes are immediately marked as non-duplicates
+
+**Phase 2: Compute MD5 for Candidates**
+- Only compute MD5 for files in size groups with >1 file
+- This dramatically reduces the number of files that need to be hashed
+- Especially beneficial for network shares where I/O is expensive
+
+```
+Example: 10,000 files scanned
+- 8,500 have unique sizes -> skip MD5 (instant)
+- 1,500 need MD5 computation -> hash only these
+Result: 85% reduction in I/O
+```
