@@ -1,5 +1,8 @@
 *.log
 
+# Test working directory (generated artifacts)
+tests/tests.work/
+
 # Python bytecode cache
 __pycache__/
 **/__pycache__/
